@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large Datasets (Extract or download separately)
+unified_dataset/
+general_dataset/
+
+# Media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.zip
+*.tar
+*.gz
+
+# Local Logs & User State
+*.log
+.recent_videos.json
+*.html
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Virtual Environments
+venv/
+env/
+.env
+
+# Old / Backup model checkpoints (keep active models mobilenetv3_deepfake.onnx, best_unified_model.pth, best_temporal_model.pth)
+best_modern_model_preff.pth
+best_modern_model.pth
