@@ -83,8 +83,8 @@ Evaluated across an international multi-source benchmark at threshold **`0.50`**
 ### 1. Installation
 Clone the repository and install the dependencies:
 ```bash
-git clone https://github.com/YOUR_USERNAME/deepfake-detection-system.git
-cd deepfake-detection-system
+git clone https://github.com/vatsal251/realtime-deepfake-detection-system.git
+cd realtime-deepfake-detection-system
 pip install -r requirements.txt
 ```
 
@@ -123,8 +123,7 @@ pip install -r requirements.txt
 ├── export_onnx.py                # PyTorch to ONNX graph converter
 ├── eval_random_videos.py         # Multi-dataset automated evaluation benchmark
 ├── run.bat                       # One-click Windows launch script
-├── requirements.txt              # Project Python dependencies
-└── EVALUATOR_MASTER_GUIDE.md     # Comprehensive academic & viva defense guide
+└── requirements.txt              # Project Python dependencies
 ```
 
 ---
