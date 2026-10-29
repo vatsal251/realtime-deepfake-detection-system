@@ -453,24 +453,21 @@ class DeepfakeClassifier:
             prob_t = torch.softmax(out_t, dim=1).cpu().numpy()[0]
             t_fake = float(prob_t[0])
 
-        # 3. Adaptive Multi-Domain Fusion: Unified across all manipulation types
-        if s_fake >= 0.55:
-            # Spatial / Frequency manipulation detected (NeuralTextures, Face2Face, FaceSwap, Deepfakes)
-            fused_score = s_fake
-            label = "fake"
-        elif t_fake >= 0.60:
-            # Temporal motion glitch / jitter detected (Celeb-DF, inter-frame warping)
-            fused_score = t_fake
-            label = "fake"
-        elif s_fake >= 0.45 and t_fake >= 0.40:
-            # Consensus borderline evidence
-            fused_score = 0.50 * s_fake + 0.50 * t_fake
-            label = "fake"
+        # 3. Continuous Adaptive Multi-Domain Fusion without step discontinuities
+        if s_fake >= 0.70:
+            # High-confidence spatial artifact (FaceForensics++, Face2Face, NeuralTextures)
+            fused_score = 0.85 * s_fake + 0.15 * t_fake
+        elif t_fake >= 0.70:
+            # High-confidence temporal jitter / warping (Celeb-DF, Wav2Lip)
+            fused_score = 0.25 * s_fake + 0.75 * t_fake
+        elif s_fake >= 0.50 or t_fake >= 0.50:
+            # Moderate evidence: balanced consensus
+            fused_score = 0.55 * s_fake + 0.45 * t_fake
         else:
             # Both streams confirm natural unmanipulated video
             fused_score = 0.60 * s_fake + 0.40 * t_fake
-            label = "real"
 
+        label = "fake" if fused_score >= 0.50 else "real"
         confidence = fused_score if label == "fake" else (1.0 - fused_score)
         return label, confidence, s_fake, t_fake
 
@@ -491,6 +488,23 @@ def get_iou(boxA, boxB):
     # Compute the intersection over union
     iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
     return iou
+
+
+def match_boxes(boxA, boxB):
+    """Robust tracker matching combining IoU and normalized center distance."""
+    iou = get_iou(boxA, boxB)
+    if iou > 0.25:
+        return iou
+    # Proximity matching: prevents track resets during head tilts and subtle movement
+    cA_x, cA_y = (boxA[0] + boxA[2]) / 2.0, (boxA[1] + boxA[3]) / 2.0
+    cB_x, cB_y = (boxB[0] + boxB[2]) / 2.0, (boxB[1] + boxB[3]) / 2.0
+    wA, hA = (boxA[2] - boxA[0]), (boxA[3] - boxA[1])
+    wB, hB = (boxB[2] - boxB[0]), (boxB[3] - boxB[1])
+    avg_dim = max(10.0, (wA + hA + wB + hB) / 4.0)
+    dist = np.hypot(cA_x - cB_x, cA_y - cB_y) / avg_dim
+    if dist < 0.60:
+        return max(0.26, 1.0 - dist)
+    return 0.0
 
 
 def main():
@@ -592,9 +606,11 @@ def main():
     # Temporal smoothing tracker initialization
     active_tracks = {}
     next_track_id = 0
-    smoothing_factor = 0.25  # Responsive EMA: smooths jitter within ~3-4 frames without sticky lag
-    hysteresis = 0.05        # Gentle anti-flicker margin
+    smoothing_factor = 0.18  # Balanced EMA: steady transitions without abrupt jumps
+    hysteresis = 0.06        # Robust anti-flicker deadband margin
     show_diagnostics = True
+    is_paused = False
+    is_topmost = False
     
     window_name = "Real-Time Deepfake Detection HUD (Screen / Meeting)" if is_screen else "Real-Time Deepfake Detection HUD"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -610,263 +626,316 @@ def main():
                 user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
         except Exception:
             pass
-    
+
+    display_frame = None
+
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("End of video stream or error reading frame.")
-            break
-            
-        frame_count += 1
-        
-        # Measure detection and alignment latency
-        detection_start = time.time()
-        faces = detector.detect(frame)
-        detection_latency = (time.time() - detection_start) * 1000.0
-        
-        face_crops = []
-        valid_boxes = []
-        h_orig, w_orig = frame.shape[:2]
-        
-        for (x, y, w, h) in faces:
-            # Add padding to cropped face logic for cleaner classification context
-            pad_x = int(w * 0.1)
-            pad_y = int(h * 0.1)
-            x1 = max(0, x - pad_x)
-            y1 = max(0, y - pad_y)
-            x2 = min(w_orig, x + w + pad_x)
-            y2 = min(h_orig, y + h + pad_y)
-            
-            crop = frame[y1:y2, x1:x2]
-            if crop.size > 0:
-                face_crops.append(crop)
-                valid_boxes.append((x1, y1, x2, y2))
+        if not is_paused:
+            ret, frame = cap.read()
+            if not ret:
+                print("End of video stream or error reading frame.")
+                break
                 
-        # Classification
-        classification_latency = 0.0
-        classes_predicted = []
-        
-        if face_crops and not classifier.is_temporal and not classifier.is_hybrid:
-            class_start = time.time()
-            classes_predicted = classifier.classify_batch(face_crops)
-            classification_latency = (time.time() - class_start) * 1000.0
+            frame_count += 1
+            h_orig, w_orig = frame.shape[:2]
             
-        # Match detections with existing tracks (IoU matching)
-        matched_track_ids = {}
-        for det_idx, det_box in enumerate(valid_boxes):
-            best_iou = 0.0
-            best_track_id = None
-            for track_id, track in active_tracks.items():
-                iou = get_iou(det_box, track['box'])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_track_id = track_id
-            if best_iou > 0.3:
-                matched_track_ids[det_idx] = best_track_id
-                
-        # Update tracks / Create new tracks
-        from collections import deque
-        for det_idx, det_box in enumerate(valid_boxes):
-            crop = face_crops[det_idx]
-            
-            if det_idx in matched_track_ids:
-                track_id = matched_track_ids[det_idx]
-                track = active_tracks[track_id]
-                track['box'] = det_box
-                track['missed_frames'] = 0
-                track['history'].append(crop)
-                
-                if classifier.is_hybrid:
-                    class_start = time.time()
-                    h_label, h_conf, s_prob, t_prob = classifier.classify_hybrid(crop, list(track['history']))
-                    classification_latency = (time.time() - class_start) * 1000.0
-                    raw_fake_prob = h_conf if h_label == "fake" else (1.0 - h_conf)
-                    track['s_fake'] = s_prob
-                    track['t_fake'] = t_prob
-                elif classifier.is_temporal:
-                    class_start = time.time()
-                    t_label, t_conf = classifier.classify_sequence(list(track['history']))
-                    classification_latency = (time.time() - class_start) * 1000.0
-                    raw_fake_prob = t_conf if t_label == "fake" else (1.0 - t_conf)
-                else:
-                    label, confidence = classes_predicted[det_idx]
-                    raw_fake_prob = confidence if label == "fake" else (1.0 - confidence)
-
-                track['raw_fake_prob'] = raw_fake_prob
-                # Exponential Moving Average for fake probability smoothing
-                track['smoothed_fake_prob'] = smoothing_factor * raw_fake_prob + (1.0 - smoothing_factor) * track.get('smoothed_fake_prob', raw_fake_prob)
+            # High-resolution screen optimization: downscale frame for detection to ensure 45+ FPS
+            detection_start = time.time()
+            if w_orig > 1080:
+                det_scale = 960.0 / w_orig
+                small_frame = cv2.resize(frame, (960, int(h_orig * det_scale)))
+                raw_faces = detector.detect(small_frame)
+                faces = [(int(fx / det_scale), int(fy / det_scale), int(fw / det_scale), int(fh / det_scale))
+                         for (fx, fy, fw, fh) in raw_faces]
             else:
-                # Initialize new track
-                track_id = next_track_id
-                next_track_id += 1
-                hist = deque(maxlen=8)
-                hist.append(crop)
+                faces = detector.detect(frame)
+            detection_latency = (time.time() - detection_start) * 1000.0
+            
+            face_crops = []
+            valid_boxes = []
+            
+            for (x, y, w, h) in faces:
+                # Add 10% padding to face crop for boundary seam analysis
+                pad_x = int(w * 0.1)
+                pad_y = int(h * 0.1)
+                x1 = max(0, x - pad_x)
+                y1 = max(0, y - pad_y)
+                x2 = min(w_orig, x + w + pad_x)
+                y2 = min(h_orig, y + h + pad_y)
                 
-                s_init, t_init = None, None
-                if classifier.is_hybrid:
-                    class_start = time.time()
-                    h_label, h_conf, s_prob, t_prob = classifier.classify_hybrid(crop, list(hist))
-                    classification_latency = (time.time() - class_start) * 1000.0
-                    raw_fake_prob = h_conf if h_label == "fake" else (1.0 - h_conf)
-                    s_init, t_init = s_prob, t_prob
-                elif classifier.is_temporal:
-                    t_label, t_conf = classifier.classify_sequence(list(hist))
-                    raw_fake_prob = t_conf if t_label == "fake" else (1.0 - t_conf)
-                else:
-                    label, confidence = classes_predicted[det_idx]
-                    raw_fake_prob = confidence if label == "fake" else (1.0 - confidence)
-
-                init_label = 'fake' if raw_fake_prob >= fake_threshold else 'real'
-                new_track = {
-                    'box': det_box,
-                    'raw_fake_prob': raw_fake_prob,
-                    'smoothed_fake_prob': raw_fake_prob,
-                    'missed_frames': 0,
-                    'label': init_label,
-                    'history': hist
-                }
-                if s_init is not None:
-                    new_track['s_fake'] = s_init
-                    new_track['t_fake'] = t_init
-                active_tracks[track_id] = new_track
-
-                
-        # Handle missed tracks
-        active_track_ids = list(active_tracks.keys())
-        matched_ids_set = set(matched_track_ids.values())
-        for track_id in active_track_ids:
-            if track_id not in matched_ids_set:
-                active_tracks[track_id]['missed_frames'] += 1
-                # If face is lost for more than 10 frames, remove it
-                if active_tracks[track_id]['missed_frames'] > 10:
-                    del active_tracks[track_id]
+                crop = frame[y1:y2, x1:x2]
+                if crop.size > 0:
+                    face_crops.append(crop)
+                    valid_boxes.append((x1, y1, x2, y2))
                     
-        # Draw Overlays using temporally smoothed tracks
-        for track_id, track in active_tracks.items():
-            if track['missed_frames'] > 0:
-                continue # Don't draw tracks that were not detected in this frame
-                
-            x1, y1, x2, y2 = track['box']
-            smoothed_fake = track['smoothed_fake_prob']
-            raw_fake = track.get('raw_fake_prob', smoothed_fake)
-            prev_label = track.get('label', None)
+            # Classification
+            classification_latency = 0.0
+            classes_predicted = []
             
-            # Anti-flicker hysteresis using temporally smoothed probability
-            if prev_label == 'fake':
-                # Currently fake: stay fake unless probability drops cleanly below threshold
-                is_fake = smoothed_fake >= (fake_threshold - hysteresis)
-            else:
-                # Currently real: stay real unless probability rises cleanly above threshold
-                is_fake = smoothed_fake >= (fake_threshold + hysteresis)
+            if face_crops and not classifier.is_temporal and not classifier.is_hybrid:
+                class_start = time.time()
+                classes_predicted = classifier.classify_batch(face_crops)
+                classification_latency = (time.time() - class_start) * 1000.0
                 
-            track['label'] = 'fake' if is_fake else 'real'
+            # Match detections with existing tracks (IoU + Centroid proximity)
+            matched_track_ids = {}
+            for det_idx, det_box in enumerate(valid_boxes):
+                best_score = 0.0
+                best_track_id = None
+                for track_id, track in active_tracks.items():
+                    score = match_boxes(det_box, track['box'])
+                    if score > best_score:
+                        best_score = score
+                        best_track_id = track_id
+                if best_score > 0.25:
+                    matched_track_ids[det_idx] = best_track_id
+                    
+            # Update tracks / Create new tracks
+            from collections import deque
+            for det_idx, det_box in enumerate(valid_boxes):
+                crop = face_crops[det_idx]
+                
+                if det_idx in matched_track_ids:
+                    track_id = matched_track_ids[det_idx]
+                    track = active_tracks[track_id]
+                    old_b = track['box']
+                    # Smooth box coordinates (70% current, 30% previous) to eliminate jitter
+                    track['box'] = (
+                        int(0.70 * det_box[0] + 0.30 * old_b[0]),
+                        int(0.70 * det_box[1] + 0.30 * old_b[1]),
+                        int(0.70 * det_box[2] + 0.30 * old_b[2]),
+                        int(0.70 * det_box[3] + 0.30 * old_b[3])
+                    )
+                    track['missed_frames'] = 0
+                    track['history'].append(crop)
+                    
+                    if classifier.is_hybrid:
+                        class_start = time.time()
+                        h_label, h_conf, s_prob, t_prob = classifier.classify_hybrid(crop, list(track['history']))
+                        classification_latency = (time.time() - class_start) * 1000.0
+                        raw_fake_prob = h_conf if h_label == "fake" else (1.0 - h_conf)
+                        track['s_fake'] = s_prob
+                        track['t_fake'] = t_prob
+                    elif classifier.is_temporal:
+                        class_start = time.time()
+                        t_label, t_conf = classifier.classify_sequence(list(track['history']))
+                        classification_latency = (time.time() - class_start) * 1000.0
+                        raw_fake_prob = t_conf if t_label == "fake" else (1.0 - t_conf)
+                    else:
+                        label, confidence = classes_predicted[det_idx]
+                        raw_fake_prob = confidence if label == "fake" else (1.0 - confidence)
 
-            if is_fake:
-                smoothed_label = "fake"
-                smoothed_conf = smoothed_fake
-            else:
-                smoothed_label = "real"
-                smoothed_conf = 1.0 - smoothed_fake
+                    track['raw_fake_prob'] = raw_fake_prob
+                    if 'pred_history' not in track:
+                        track['pred_history'] = deque(maxlen=10)
+                    track['pred_history'].append(raw_fake_prob)
+                    
+                    # Median filter across rolling window eliminates random single-frame outliers
+                    median_prob = float(np.median(list(track['pred_history'])))
+                    track['smoothed_fake_prob'] = smoothing_factor * median_prob + (1.0 - smoothing_factor) * track.get('smoothed_fake_prob', median_prob)
+                else:
+                    # Initialize new track
+                    track_id = next_track_id
+                    next_track_id += 1
+                    hist = deque(maxlen=8)
+                    hist.append(crop)
+                    pred_hist = deque(maxlen=10)
+                    
+                    s_init, t_init = None, None
+                    if classifier.is_hybrid:
+                        class_start = time.time()
+                        h_label, h_conf, s_prob, t_prob = classifier.classify_hybrid(crop, list(hist))
+                        classification_latency = (time.time() - class_start) * 1000.0
+                        raw_fake_prob = h_conf if h_label == "fake" else (1.0 - h_conf)
+                        s_init, t_init = s_prob, t_prob
+                    elif classifier.is_temporal:
+                        t_label, t_conf = classifier.classify_sequence(list(hist))
+                        raw_fake_prob = t_conf if t_label == "fake" else (1.0 - t_conf)
+                    else:
+                        label, confidence = classes_predicted[det_idx]
+                        raw_fake_prob = confidence if label == "fake" else (1.0 - confidence)
+
+                    pred_hist.append(raw_fake_prob)
+                    init_label = 'fake' if raw_fake_prob >= fake_threshold else 'real'
+                    new_track = {
+                        'box': det_box,
+                        'raw_fake_prob': raw_fake_prob,
+                        'smoothed_fake_prob': raw_fake_prob,
+                        'pred_history': pred_hist,
+                        'missed_frames': 0,
+                        'label': init_label,
+                        'dwell_counter': 0,
+                        'history': hist
+                    }
+                    if s_init is not None:
+                        new_track['s_fake'] = s_init
+                        new_track['t_fake'] = t_init
+                    active_tracks[track_id] = new_track
+                    
+            # Handle missed tracks
+            active_track_ids = list(active_tracks.keys())
+            matched_ids_set = set(matched_track_ids.values())
+            for track_id in active_track_ids:
+                if track_id not in matched_ids_set:
+                    active_tracks[track_id]['missed_frames'] += 1
+                    # If face is lost for more than 15 frames, remove it
+                    if active_tracks[track_id]['missed_frames'] > 15:
+                        del active_tracks[track_id]
+                        
+            # Draw Overlays using temporally stabilized tracks
+            for track_id, track in active_tracks.items():
+                if track['missed_frames'] > 0:
+                    continue
+                    
+                x1, y1, x2, y2 = track['box']
+                smoothed_fake = track['smoothed_fake_prob']
+                prev_label = track.get('label', 'real')
                 
-            color = (0, 0, 255) if is_fake else (0, 255, 0) # Red for Fake, Green for Real
-            
-            # Draw Face bounding box with double outline styling
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Label banner
-            text = f"{smoothed_label.upper()} ({smoothed_conf*100:.1f}%)"
-            font = cv2.FONT_HERSHEY_DUPLEX
-            text_size = cv2.getTextSize(text, font, 0.55, 1)[0]
-            banner_h = 24
-            
-            # Position banner above face box, or inside top of box if near the top edge of frame
-            if y1 - banner_h - 2 >= 0:
-                b_y1 = y1 - banner_h
-                b_y2 = y1
-                t_y = y1 - 6
-            else:
-                b_y1 = y1
-                b_y2 = y1 + banner_h
-                t_y = y1 + 18
-            
-            # Banner background and text
-            b_x2 = min(x1 + text_size[0] + 12, frame.shape[1] - 1)
-            cv2.rectangle(frame, (x1, b_y1), (b_x2, b_y2), color, -1)
-            cv2.putText(frame, text, (x1 + 6, t_y), font, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-            
-        # Calculate Frame-rate
-        if frame_count % 10 == 0:
-            end_time = time.time()
-            fps = 10.0 / max(end_time - fps_start_time, 1e-5)
-            fps_start_time = end_time
-            
-        # Display Diagnostics OUTSIDE the video (in a bottom telemetry dock bar)
-        if show_diagnostics:
-            h_f, w_f = frame.shape[:2]
-            bar_height = 36
-            display_frame = cv2.copyMakeBorder(
-                frame, 0, bar_height, 0, 0,
-                borderType=cv2.BORDER_CONSTANT,
-                value=(22, 22, 28)
-            )
-            cv2.line(display_frame, (0, h_f), (w_f, h_f), (50, 50, 60), 1)
-            
-            # Formatted telemetry metrics
-            fps_color = (80, 220, 100) if fps >= 25 else (80, 180, 240)
-            if classifier.is_hybrid:
-                engine_str = "Hybrid"
-                last_s, last_t = None, None
-                for t in active_tracks.values():
-                    if 's_fake' in t:
-                        last_s = t['s_fake']
-                        last_t = t['t_fake']
+                # Anti-flicker hysteresis deadband (±0.06)
+                if prev_label == 'fake':
+                    target_label = 'fake' if smoothed_fake >= (fake_threshold - hysteresis) else 'real'
+                else:
+                    target_label = 'fake' if smoothed_fake >= (fake_threshold + hysteresis) else 'real'
+                    
+                # Dwell time confirmation: requires 4 consecutive agreeing frames to switch state
+                if target_label != prev_label:
+                    track['dwell_counter'] = track.get('dwell_counter', 0) + 1
+                    if track['dwell_counter'] >= 4:
+                        track['label'] = target_label
+                        track['dwell_counter'] = 0
+                else:
+                    track['dwell_counter'] = 0
+                    
+                is_fake = (track['label'] == 'fake')
+                smoothed_conf = smoothed_fake if is_fake else (1.0 - smoothed_fake)
+                
+                # Cyber/Forensic Bounding Box styling
+                color = (30, 45, 245) if is_fake else (40, 220, 80) # Vivid Coral Red vs Neon Green
+                
+                # Dark drop-shadow for high contrast over any background
+                cv2.rectangle(frame, (x1 - 1, y1 - 1), (x2 + 1, y2 + 1), (12, 12, 18), 3)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Cyber corner accent brackets
+                c_len = min(16, max(6, int((x2 - x1) * 0.15)))
+                cv2.line(frame, (x1, y1), (x1 + c_len, y1), (255, 255, 255), 2)
+                cv2.line(frame, (x1, y1), (x1, y1 + c_len), (255, 255, 255), 2)
+                cv2.line(frame, (x2, y1), (x2 - c_len, y1), (255, 255, 255), 2)
+                cv2.line(frame, (x2, y1), (x2, y1 + c_len), (255, 255, 255), 2)
+                cv2.line(frame, (x1, y2), (x1 + c_len, y2), (255, 255, 255), 2)
+                cv2.line(frame, (x1, y2), (x1, y2 - c_len), (255, 255, 255), 2)
+                cv2.line(frame, (x2, y2), (x2 - c_len, y2), (255, 255, 255), 2)
+                cv2.line(frame, (x2, y2), (x2, y2 - c_len), (255, 255, 255), 2)
+                
+                # Banner with confidence percentage and stability indicator
+                tag = "FAKE" if is_fake else "REAL"
+                text = f"[{tag}] {smoothed_conf*100:.1f}%"
+                font = cv2.FONT_HERSHEY_DUPLEX
+                text_size = cv2.getTextSize(text, font, 0.52, 1)[0]
+                banner_h = 24
+                
+                if y1 - banner_h - 4 >= 0:
+                    b_y1, b_y2, t_y = y1 - banner_h - 4, y1 - 2, y1 - 8
+                else:
+                    b_y1, b_y2, t_y = y1 + 2, y1 + banner_h + 2, y1 + 18
+                    
+                b_x2 = min(x1 + text_size[0] + 16, frame.shape[1] - 1)
+                cv2.rectangle(frame, (x1 - 1, b_y1 - 1), (b_x2 + 1, b_y2 + 1), (15, 15, 20), -1)
+                cv2.rectangle(frame, (x1, b_y1), (b_x2, b_y2), color, -1)
+                cv2.putText(frame, text, (x1 + 8, t_y), font, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+                
+            # Calculate Frame-rate
+            if frame_count % 10 == 0:
+                end_time = time.time()
+                fps = 10.0 / max(end_time - fps_start_time, 1e-5)
+                fps_start_time = end_time
+                
+            # Display Diagnostics OUTSIDE the video (in a bottom telemetry dock bar)
+            if show_diagnostics:
+                h_f, w_f = frame.shape[:2]
+                bar_height = 36
+                display_frame = cv2.copyMakeBorder(
+                    frame, 0, bar_height, 0, 0,
+                    borderType=cv2.BORDER_CONSTANT,
+                    value=(22, 22, 28)
+                )
+                cv2.line(display_frame, (0, h_f), (w_f, h_f), (50, 50, 60), 1)
+                
+                # Formatted telemetry metrics
+                fps_color = (80, 220, 100) if fps >= 25 else (80, 180, 240)
+                if classifier.is_hybrid:
+                    engine_str = "Hybrid"
+                    last_s, last_t = None, None
+                    for t in active_tracks.values():
+                        if 's_fake' in t:
+                            last_s = t['s_fake']
+                            last_t = t['t_fake']
+                            break
+                    items = [
+                        (f"FPS: {fps:.1f}", fps_color),
+                        (f"Spatial: {last_s*100:.0f}%" if last_s is not None else "Spatial: --", (210, 210, 215)),
+                        (f"Temporal: {last_t*100:.0f}%" if last_t is not None else "Temporal: --", (210, 210, 215)),
+                        (f"Latency: {classification_latency:.1f}ms", (210, 210, 215)),
+                        (f"Faces: {len(faces)}", (210, 210, 215)),
+                        (f"Engine: {engine_str}", (80, 200, 255))
+                    ]
+                else:
+                    engine_str = "ONNX" if args.backend == "onnx" else "PyTorch"
+                    items = [
+                        (f"FPS: {fps:.1f}", fps_color),
+                        (f"Detect: {detection_latency:.1f}ms", (210, 210, 215)),
+                        (f"Classifier: {classification_latency:.1f}ms", (210, 210, 215)),
+                        (f"Faces: {len(faces)}", (210, 210, 215)),
+                        (f"Engine: {engine_str}", (230, 180, 100))
+                    ]
+                
+                pip_str = "PIP: ON ('t')" if is_topmost else "PIP: OFF ('t')"
+                items.append((pip_str, (120, 220, 255) if is_topmost else (160, 160, 170)))
+                
+                if is_screen:
+                    items.append(("Screen ('s':Crop 'f':Full)", (255, 180, 50)))
+                
+                cur_x = 16
+                text_y = h_f + 24
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.44
+                
+                for idx, (item_txt, item_col) in enumerate(items):
+                    t_w = cv2.getTextSize(item_txt, font, font_scale, 1)[0][0]
+                    if cur_x + t_w > w_f - 10:
                         break
-                items = [
-                    (f"FPS: {fps:.1f}", fps_color),
-                    (f"Spatial: {last_s*100:.0f}%" if last_s is not None else "Spatial: --", (210, 210, 215)),
-                    (f"Temporal: {last_t*100:.0f}%" if last_t is not None else "Temporal: --", (210, 210, 215)),
-                    (f"Latency: {classification_latency:.1f}ms", (210, 210, 215)),
-                    (f"Faces: {len(faces)}", (210, 210, 215)),
-                    (f"Engine: {engine_str}", (80, 200, 255))
-                ]
+                    cv2.putText(display_frame, item_txt, (cur_x, text_y), font, font_scale, item_col, 1, cv2.LINE_AA)
+                    cur_x += t_w + 14
+                    if idx < len(items) - 1 and cur_x < w_f - 30:
+                        cv2.putText(display_frame, "|", (cur_x - 7, text_y), font, font_scale, (70, 70, 80), 1, cv2.LINE_AA)
+                        cur_x += 8
             else:
-                engine_str = "ONNX" if args.backend == "onnx" else "PyTorch"
-                items = [
-                    (f"FPS: {fps:.1f}", fps_color),
-                    (f"Detect: {detection_latency:.1f}ms", (210, 210, 215)),
-                    (f"Classifier: {classification_latency:.1f}ms", (210, 210, 215)),
-                    (f"Faces: {len(faces)}", (210, 210, 215)),
-                    (f"Engine: {engine_str}", (230, 180, 100))
-                ]
-            
-            if is_screen:
-                items.append(("Screen Mode ('s':Crop 'f':Full)", (255, 180, 50)))
-            
-            cur_x = 16
-            text_y = h_f + 24
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.44
-            
-            for idx, (item_txt, item_col) in enumerate(items):
-                t_w = cv2.getTextSize(item_txt, font, font_scale, 1)[0][0]
-                if cur_x + t_w > w_f - 10:
-                    break
-                cv2.putText(display_frame, item_txt, (cur_x, text_y), font, font_scale, item_col, 1, cv2.LINE_AA)
-                cur_x += t_w + 14
-                if idx < len(items) - 1 and cur_x < w_f - 30:
-                    cv2.putText(display_frame, "|", (cur_x - 7, text_y), font, font_scale, (70, 70, 80), 1, cv2.LINE_AA)
-                    cur_x += 8
-        else:
-            display_frame = frame
+                display_frame = frame
         
         # Render clean view
-        cv2.imshow(window_name, display_frame)
+        render_img = display_frame if display_frame is not None else frame
+        if is_paused:
+            # Draw Freeze-Frame Banner
+            pause_banner = render_img.copy()
+            cv2.rectangle(pause_banner, (0, 0), (render_img.shape[1], 32), (0, 0, 180), -1)
+            cv2.addWeighted(pause_banner, 0.70, render_img, 0.30, 0, render_img)
+            cv2.putText(render_img, "FREEZE-FRAME PAUSED | PRESS SPACE TO RESUME",
+                        (16, 22), cv2.FONT_HERSHEY_DUPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.imshow(window_name, render_img)
         
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1 if not is_paused else 25) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('d'):
             show_diagnostics = not show_diagnostics
+        elif key == 32:  # SPACE bar
+            is_paused = not is_paused
+            print(f"[HUD] Video {'PAUSED' if is_paused else 'RESUMED'}")
+        elif key == ord('t'):  # Toggle Picture-in-Picture Always-On-Top
+            is_topmost = not is_topmost
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1 if is_topmost else 0)
+            print(f"[HUD] Always-On-Top Picture-in-Picture: {'ON' if is_topmost else 'OFF'}")
         elif is_screen and key == ord('s'):
             # Allow interactive meeting region crop
             cap.reset_roi()
