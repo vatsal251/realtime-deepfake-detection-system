@@ -552,10 +552,22 @@ def main():
         print("   - Press 'q' to quit")
         print("="*65 + "\n")
         if args.select_roi:
+            time.sleep(0.3)  # Brief pause for background windows to stabilize
             ret_init, init_frame = cap.read()
             if ret_init:
-                roi = cv2.selectROI("Select Meeting Area (ENTER to Confirm, 'c' for Full Screen)", init_frame, fromCenter=False, showCrosshair=True)
-                cv2.destroyWindow("Select Meeting Area (ENTER to Confirm, 'c' for Full Screen)")
+                sel_frame = init_frame.copy()
+                h_s, w_s = sel_frame.shape[:2]
+                banner = sel_frame.copy()
+                cv2.rectangle(banner, (0, 0), (w_s, 60), (20, 20, 25), -1)
+                cv2.addWeighted(banner, 0.75, sel_frame, 0.25, 0, sel_frame)
+                cv2.putText(sel_frame, "DRAG A BOX OVER YOUR MEETING / YOUTUBE VIDEO, THEN PRESS ENTER OR SPACE",
+                            (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2, cv2.LINE_AA)
+                
+                win_roi_title = "Meeting Area Selector - Drag box & press ENTER (or 'c' for Full Screen)"
+                cv2.namedWindow(win_roi_title, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(win_roi_title, min(1280, w_s), min(720, h_s))
+                roi = cv2.selectROI(win_roi_title, sel_frame, fromCenter=False, showCrosshair=True)
+                cv2.destroyWindow(win_roi_title)
                 if roi and roi[2] > 20 and roi[3] > 20:
                     cap.set_roi(roi[0], roi[1], roi[2], roi[3])
         
@@ -587,7 +599,17 @@ def main():
     window_name = "Real-Time Deepfake Detection HUD (Screen / Meeting)" if is_screen else "Real-Time Deepfake Detection HUD"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     if is_screen:
-        cv2.resizeWindow(window_name, 1024, 640)
+        cv2.resizeWindow(window_name, 960, 560)
+        # Prevent window from capturing itself using Windows 10/11 Display Affinity
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            WDA_EXCLUDEFROMCAPTURE = 0x00000011
+            hwnd = user32.FindWindowW(None, window_name)
+            if hwnd:
+                user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        except Exception:
+            pass
     
     while True:
         ret, frame = cap.read()
@@ -850,8 +872,18 @@ def main():
             cap.reset_roi()
             ret_f, full_f = cap.read()
             if ret_f:
-                roi = cv2.selectROI("Select Meeting Area (ENTER to Confirm, 'c' for Full Screen)", full_f, fromCenter=False, showCrosshair=True)
-                cv2.destroyWindow("Select Meeting Area (ENTER to Confirm, 'c' for Full Screen)")
+                sel_frame = full_f.copy()
+                h_s, w_s = sel_frame.shape[:2]
+                banner = sel_frame.copy()
+                cv2.rectangle(banner, (0, 0), (w_s, 60), (20, 20, 25), -1)
+                cv2.addWeighted(banner, 0.75, sel_frame, 0.25, 0, sel_frame)
+                cv2.putText(sel_frame, "DRAG A BOX OVER YOUR MEETING / YOUTUBE VIDEO, THEN PRESS ENTER OR SPACE",
+                            (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2, cv2.LINE_AA)
+                win_roi_title = "Meeting Area Selector - Drag box & press ENTER (or 'c' for Full Screen)"
+                cv2.namedWindow(win_roi_title, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(win_roi_title, min(1280, w_s), min(720, h_s))
+                roi = cv2.selectROI(win_roi_title, sel_frame, fromCenter=False, showCrosshair=True)
+                cv2.destroyWindow(win_roi_title)
                 if roi and roi[2] > 20 and roi[3] > 20:
                     cap.set_roi(roi[0], roi[1], roi[2], roi[3])
         elif is_screen and key == ord('f'):

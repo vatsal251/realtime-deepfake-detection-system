@@ -230,12 +230,21 @@ class App(ctk.CTk):
     def _on_stopped(self):
         self._set_status("Idle - ready to detect", "#78909c")
         self.stop_btn.configure(state="disabled")
+        try:
+            self.deiconify()
+        except Exception:
+            pass
 
     def launch_webcam(self):
         self._launch(self._build_cmd(), "Webcam (live)")
 
     def launch_screen(self):
-        self._launch(self._build_cmd("screen"), "Screen / Meeting (Press 's' in HUD to crop meeting)")
+        cmd = self._build_cmd("screen") + ["--select_roi"]
+        try:
+            self.iconify()
+        except Exception:
+            pass
+        self._launch(cmd, "Live Screen / Meeting Monitor")
 
     def browse_video(self):
         path = filedialog.askopenfilename(
