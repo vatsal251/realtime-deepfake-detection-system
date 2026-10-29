@@ -4,6 +4,17 @@ import argparse
 import cv2
 import numpy as np
 
+# Enable Windows High-DPI awareness so OpenCV renders razor-sharp text and frames
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 # Try importing ML frameworks; fall back gracefully if not fully installed yet
 try:
     import torch
@@ -613,9 +624,8 @@ def main():
     is_topmost = False
     
     window_name = "Real-Time Deepfake Detection HUD (Screen / Meeting)" if is_screen else "Real-Time Deepfake Detection HUD"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     if is_screen:
-        cv2.resizeWindow(window_name, 960, 560)
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         # Prevent window from capturing itself using Windows 10/11 Display Affinity
         try:
             import ctypes
@@ -626,6 +636,9 @@ def main():
                 user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
         except Exception:
             pass
+    else:
+        # Native 1:1 razor-sharp auto-size for video files and webcam
+        cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
     display_frame = None
 
@@ -727,19 +740,27 @@ def main():
 
                     track['raw_fake_prob'] = raw_fake_prob
                     if 'pred_history' not in track:
-                        track['pred_history'] = deque(maxlen=10)
+                        track['pred_history'] = deque(maxlen=12)
                     track['pred_history'].append(raw_fake_prob)
                     
                     # Median filter across rolling window eliminates random single-frame outliers
                     median_prob = float(np.median(list(track['pred_history'])))
-                    track['smoothed_fake_prob'] = smoothing_factor * median_prob + (1.0 - smoothing_factor) * track.get('smoothed_fake_prob', median_prob)
+                    prev_smoothed = track.get('smoothed_fake_prob', median_prob)
+                    
+                    # Fast attack when manipulation rises; slow decay when speaker pauses between words (NeuralTextures)
+                    if median_prob >= prev_smoothed:
+                        alpha = 0.32  # Fast attack: locks onto manipulation cues quickly
+                    else:
+                        alpha = 0.035  # Slow decay: holds forensic peak during speech pauses / closed mouth
+                        
+                    track['smoothed_fake_prob'] = alpha * median_prob + (1.0 - alpha) * prev_smoothed
                 else:
                     # Initialize new track
                     track_id = next_track_id
                     next_track_id += 1
                     hist = deque(maxlen=8)
                     hist.append(crop)
-                    pred_hist = deque(maxlen=10)
+                    pred_hist = deque(maxlen=12)
                     
                     s_init, t_init = None, None
                     if classifier.is_hybrid:
@@ -791,16 +812,19 @@ def main():
                 smoothed_fake = track['smoothed_fake_prob']
                 prev_label = track.get('label', 'real')
                 
-                # Anti-flicker hysteresis deadband (±0.06)
+                # Asymmetric Forensic Hysteresis:
+                # Once FAKE: require drop below 0.35 for 15 frames to revert to REAL (holds through speech pauses)
+                # Once REAL: require rise above fake_threshold (0.50) for 3 frames to switch to FAKE
                 if prev_label == 'fake':
-                    target_label = 'fake' if smoothed_fake >= (fake_threshold - hysteresis) else 'real'
+                    target_label = 'real' if smoothed_fake < 0.35 else 'fake'
+                    dwell_needed = 15
                 else:
-                    target_label = 'fake' if smoothed_fake >= (fake_threshold + hysteresis) else 'real'
+                    target_label = 'fake' if smoothed_fake >= fake_threshold else 'real'
+                    dwell_needed = 3
                     
-                # Dwell time confirmation: requires 4 consecutive agreeing frames to switch state
                 if target_label != prev_label:
                     track['dwell_counter'] = track.get('dwell_counter', 0) + 1
-                    if track['dwell_counter'] >= 4:
+                    if track['dwell_counter'] >= dwell_needed:
                         track['label'] = target_label
                         track['dwell_counter'] = 0
                 else:
@@ -827,22 +851,25 @@ def main():
                 cv2.line(frame, (x2, y2), (x2 - c_len, y2), (255, 255, 255), 2)
                 cv2.line(frame, (x2, y2), (x2, y2 - c_len), (255, 255, 255), 2)
                 
-                # Banner with confidence percentage and stability indicator
+                # Adaptive bold crisp font scaling based on face bounding box width:
+                box_w = max(40, x2 - x1)
+                font_scale = max(0.62, min(1.05, box_w / 220.0))
+                font_thick = 2
+                font = cv2.FONT_HERSHEY_DUPLEX
                 tag = "FAKE" if is_fake else "REAL"
                 text = f"[{tag}] {smoothed_conf*100:.1f}%"
-                font = cv2.FONT_HERSHEY_DUPLEX
-                text_size = cv2.getTextSize(text, font, 0.52, 1)[0]
-                banner_h = 24
+                text_size = cv2.getTextSize(text, font, font_scale, font_thick)[0]
+                banner_h = text_size[1] + 12
                 
                 if y1 - banner_h - 4 >= 0:
                     b_y1, b_y2, t_y = y1 - banner_h - 4, y1 - 2, y1 - 8
                 else:
-                    b_y1, b_y2, t_y = y1 + 2, y1 + banner_h + 2, y1 + 18
+                    b_y1, b_y2, t_y = y1 + 2, y1 + banner_h + 2, y1 + banner_h - 4
                     
-                b_x2 = min(x1 + text_size[0] + 16, frame.shape[1] - 1)
+                b_x2 = min(x1 + text_size[0] + 18, frame.shape[1] - 1)
                 cv2.rectangle(frame, (x1 - 1, b_y1 - 1), (b_x2 + 1, b_y2 + 1), (15, 15, 20), -1)
                 cv2.rectangle(frame, (x1, b_y1), (b_x2, b_y2), color, -1)
-                cv2.putText(frame, text, (x1 + 8, t_y), font, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(frame, text, (x1 + 8, t_y), font, font_scale, (255, 255, 255), font_thick, cv2.LINE_AA)
                 
             # Calculate Frame-rate
             if frame_count % 10 == 0:
@@ -853,13 +880,13 @@ def main():
             # Display Diagnostics OUTSIDE the video (in a bottom telemetry dock bar)
             if show_diagnostics:
                 h_f, w_f = frame.shape[:2]
-                bar_height = 36
+                bar_height = 42
                 display_frame = cv2.copyMakeBorder(
                     frame, 0, bar_height, 0, 0,
                     borderType=cv2.BORDER_CONSTANT,
-                    value=(22, 22, 28)
+                    value=(20, 20, 26)
                 )
-                cv2.line(display_frame, (0, h_f), (w_f, h_f), (50, 50, 60), 1)
+                cv2.line(display_frame, (0, h_f), (w_f, h_f), (55, 55, 68), 1)
                 
                 # Formatted telemetry metrics
                 fps_color = (80, 220, 100) if fps >= 25 else (80, 180, 240)
@@ -873,41 +900,41 @@ def main():
                             break
                     items = [
                         (f"FPS: {fps:.1f}", fps_color),
-                        (f"Spatial: {last_s*100:.0f}%" if last_s is not None else "Spatial: --", (210, 210, 215)),
-                        (f"Temporal: {last_t*100:.0f}%" if last_t is not None else "Temporal: --", (210, 210, 215)),
-                        (f"Latency: {classification_latency:.1f}ms", (210, 210, 215)),
-                        (f"Faces: {len(faces)}", (210, 210, 215)),
-                        (f"Engine: {engine_str}", (80, 200, 255))
+                        (f"Spatial: {last_s*100:.0f}%" if last_s is not None else "Spatial: --", (220, 220, 225)),
+                        (f"Temporal: {last_t*100:.0f}%" if last_t is not None else "Temporal: --", (220, 220, 225)),
+                        (f"Latency: {classification_latency:.1f}ms", (220, 220, 225)),
+                        (f"Faces: {len(faces)}", (220, 220, 225)),
+                        (f"Engine: {engine_str}", (80, 205, 255))
                     ]
                 else:
                     engine_str = "ONNX" if args.backend == "onnx" else "PyTorch"
                     items = [
                         (f"FPS: {fps:.1f}", fps_color),
-                        (f"Detect: {detection_latency:.1f}ms", (210, 210, 215)),
-                        (f"Classifier: {classification_latency:.1f}ms", (210, 210, 215)),
-                        (f"Faces: {len(faces)}", (210, 210, 215)),
-                        (f"Engine: {engine_str}", (230, 180, 100))
+                        (f"Detect: {detection_latency:.1f}ms", (220, 220, 225)),
+                        (f"Classifier: {classification_latency:.1f}ms", (220, 220, 225)),
+                        (f"Faces: {len(faces)}", (220, 220, 225)),
+                        (f"Engine: {engine_str}", (235, 185, 105))
                     ]
                 
                 pip_str = "PIP: ON ('t')" if is_topmost else "PIP: OFF ('t')"
-                items.append((pip_str, (120, 220, 255) if is_topmost else (160, 160, 170)))
+                items.append((pip_str, (130, 225, 255) if is_topmost else (165, 165, 175)))
                 
                 if is_screen:
-                    items.append(("Screen ('s':Crop 'f':Full)", (255, 180, 50)))
+                    items.append(("Screen ('s':Crop 'f':Full)", (255, 185, 55)))
                 
-                cur_x = 16
-                text_y = h_f + 24
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.44
+                cur_x = 18
+                text_y = h_f + 28
+                font = cv2.FONT_HERSHEY_DUPLEX
+                font_scale = 0.50
                 
                 for idx, (item_txt, item_col) in enumerate(items):
                     t_w = cv2.getTextSize(item_txt, font, font_scale, 1)[0][0]
                     if cur_x + t_w > w_f - 10:
                         break
                     cv2.putText(display_frame, item_txt, (cur_x, text_y), font, font_scale, item_col, 1, cv2.LINE_AA)
-                    cur_x += t_w + 14
+                    cur_x += t_w + 16
                     if idx < len(items) - 1 and cur_x < w_f - 30:
-                        cv2.putText(display_frame, "|", (cur_x - 7, text_y), font, font_scale, (70, 70, 80), 1, cv2.LINE_AA)
+                        cv2.putText(display_frame, "|", (cur_x - 8, text_y), font, font_scale, (70, 70, 80), 1, cv2.LINE_AA)
                         cur_x += 8
             else:
                 display_frame = frame
