@@ -36,6 +36,87 @@ except ImportError:
     HAS_MEDIAPIPE = False
 
 
+class ScreenCapture:
+    """High-speed screen capture streamer for real-time meetings and desktop video."""
+    def __init__(self, monitor_idx=1, bbox=None, target_fps=30):
+        self.bbox = bbox
+        self.target_fps = target_fps
+        self.frame_delay = 1.0 / target_fps
+        self.last_grab = 0
+        self.is_opened = True
+        self.use_mss = False
+        self.sct = None
+        
+        try:
+            import mss
+            self.sct = mss.mss()
+            monitors = self.sct.monitors
+            if monitor_idx < len(monitors):
+                self.monitor = monitors[monitor_idx]
+            else:
+                self.monitor = monitors[0]
+            self.use_mss = True
+            print(f"[ScreenCapture] High-speed MSS active ({self.monitor['width']}x{self.monitor['height']}).")
+        except Exception as e:
+            print(f"[ScreenCapture] MSS notice: {e}. Falling back to PIL ImageGrab.")
+            self.use_mss = False
+
+    def isOpened(self):
+        return self.is_opened
+
+    def set_roi(self, x, y, w, h):
+        if w > 20 and h > 20:
+            if self.use_mss and self.sct:
+                base_left = self.monitor.get('left', 0)
+                base_top = self.monitor.get('top', 0)
+                self.bbox = {
+                    "left": int(base_left + x),
+                    "top": int(base_top + y),
+                    "width": int(w),
+                    "height": int(h)
+                }
+            else:
+                self.bbox = (int(x), int(y), int(x + w), int(y + h))
+            print(f"[ScreenCapture] Locked ROI: {w}x{h} at ({x}, {y})")
+
+    def reset_roi(self):
+        self.bbox = None
+        print("[ScreenCapture] Reset to Full Screen.")
+
+    def read(self):
+        if not self.is_opened:
+            return False, None
+            
+        now = time.time()
+        elapsed = now - self.last_grab
+        if elapsed < self.frame_delay:
+            time.sleep(max(0.001, self.frame_delay - elapsed))
+        self.last_grab = time.time()
+        
+        try:
+            if self.use_mss and self.sct:
+                target = self.bbox if self.bbox is not None else self.monitor
+                img = np.array(self.sct.grab(target))
+                frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                return True, frame
+            else:
+                from PIL import ImageGrab
+                img = ImageGrab.grab(bbox=self.bbox if isinstance(self.bbox, tuple) else None)
+                frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                return True, frame
+        except Exception:
+            time.sleep(0.05)
+            return False, None
+
+    def release(self):
+        self.is_opened = False
+        if self.use_mss and self.sct:
+            try:
+                self.sct.close()
+            except Exception:
+                pass
+
+
 class FaceDetector:
     """Face detection supporting MediaPipe (best), YOLOv8, and Haar Cascade (fallback)."""
     def __init__(self, mode="mediapipe", yolo_weights="yolov8n-face.pt"):
@@ -414,7 +495,8 @@ def get_iou(boxA, boxB):
 
 def main():
     parser = argparse.ArgumentParser(description="Real-Time Deepfake Detection Inference")
-    parser.add_argument("--input", type=str, default="0", help="Camera index (e.g. 0) or path to input video file")
+    parser.add_argument("--input", type=str, default="0", help="Camera index (e.g. 0), path to input video file, or 'screen' for live screen/meeting capture")
+    parser.add_argument("--select_roi", action="store_true", help="Interactively select a meeting window / screen region to monitor")
     parser.add_argument("--detector", type=str, choices=["mediapipe", "yolo", "cascade"], default="mediapipe", help="Face detector: mediapipe (best), yolo, or cascade (fallback)")
     parser.add_argument("--backend", type=str, choices=["hybrid", "pytorch", "onnx"], default="hybrid", help="Inference engine backend: hybrid (Spatial+Temporal auto-fusion), onnx, or pytorch")
     parser.add_argument("--model", type=str, default="mobilenetv3_deepfake.onnx", help="Path to classifier weights file")
@@ -447,12 +529,35 @@ def main():
         return
 
     # Check frame sources
-    is_webcam = args.input.isdigit()
-    cap = cv2.VideoCapture(int(args.input) if is_webcam else args.input)
+    is_screen = (args.input.lower() == "screen")
+    is_webcam = args.input.isdigit() if not is_screen else False
+    
+    if is_screen:
+        cap = ScreenCapture()
+    else:
+        cap = cv2.VideoCapture(int(args.input) if is_webcam else args.input)
     
     if not cap.isOpened():
         print(f"Error: Could not open video source: {args.input}")
         return
+
+    if is_screen:
+        print("\n" + "="*65)
+        print("🖥️  LIVE SCREEN & MEETING DETECTION ACTIVE")
+        print("• Monitoring live desktop / Zoom / Teams / Google Meet / YouTube")
+        print("• Controls in HUD:")
+        print("   - Press 's' to drag & select a specific Meeting window ROI")
+        print("   - Press 'f' to return to Full Screen monitoring")
+        print("   - Press 'd' to toggle the bottom diagnostics dock")
+        print("   - Press 'q' to quit")
+        print("="*65 + "\n")
+        if args.select_roi:
+            ret_init, init_frame = cap.read()
+            if ret_init:
+                roi = cv2.selectROI("Select Meeting Area (ENTER to Confirm, 'c' for Full Screen)", init_frame, fromCenter=False, showCrosshair=True)
+                cv2.destroyWindow("Select Meeting Area (ENTER to Confirm, 'c' for Full Screen)")
+                if roi and roi[2] > 20 and roi[3] > 20:
+                    cap.set_roi(roi[0], roi[1], roi[2], roi[3])
         
     print("Initializing components...")
     detector = FaceDetector(mode=args.detector)
@@ -478,6 +583,11 @@ def main():
     smoothing_factor = 0.25  # Responsive EMA: smooths jitter within ~3-4 frames without sticky lag
     hysteresis = 0.05        # Gentle anti-flicker margin
     show_diagnostics = True
+    
+    window_name = "Real-Time Deepfake Detection HUD (Screen / Meeting)" if is_screen else "Real-Time Deepfake Detection HUD"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    if is_screen:
+        cv2.resizeWindow(window_name, 1024, 640)
     
     while True:
         ret, frame = cap.read()
@@ -707,6 +817,9 @@ def main():
                     (f"Engine: {engine_str}", (230, 180, 100))
                 ]
             
+            if is_screen:
+                items.append(("Screen Mode ('s':Crop 'f':Full)", (255, 180, 50)))
+            
             cur_x = 16
             text_y = h_f + 24
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -725,13 +838,24 @@ def main():
             display_frame = frame
         
         # Render clean view
-        cv2.imshow("Real-Time Deepfake Detection HUD", display_frame)
+        cv2.imshow(window_name, display_frame)
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('d'):
             show_diagnostics = not show_diagnostics
+        elif is_screen and key == ord('s'):
+            # Allow interactive meeting region crop
+            cap.reset_roi()
+            ret_f, full_f = cap.read()
+            if ret_f:
+                roi = cv2.selectROI("Select Meeting Area (ENTER to Confirm, 'c' for Full Screen)", full_f, fromCenter=False, showCrosshair=True)
+                cv2.destroyWindow("Select Meeting Area (ENTER to Confirm, 'c' for Full Screen)")
+                if roi and roi[2] > 20 and roi[3] > 20:
+                    cap.set_roi(roi[0], roi[1], roi[2], roi[3])
+        elif is_screen and key == ord('f'):
+            cap.reset_roi()
             
     cap.release()
     cv2.destroyAllWindows()

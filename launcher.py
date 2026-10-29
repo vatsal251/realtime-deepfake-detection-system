@@ -45,25 +45,40 @@ class App(ctk.CTk):
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", **pad)
+
+        # 2x2 Action Buttons Grid
+        actions_grid = ctk.CTkFrame(btn_frame, fg_color="transparent")
+        actions_grid.pack(fill="x")
+        actions_grid.columnconfigure(0, weight=1)
+        actions_grid.columnconfigure(1, weight=1)
+
         self.webcam_btn = ctk.CTkButton(
-            btn_frame, text="Open Webcam", height=52,
-            font=ctk.CTkFont(size=15, weight="bold"),
+            actions_grid, text="🎥  Open Webcam", height=46,
+            font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#1565c0", hover_color="#1976d2",
             command=self.launch_webcam)
-        self.webcam_btn.pack(fill="x", pady=(0, 8))
+        self.webcam_btn.grid(row=0, column=0, padx=(0, 4), pady=(0, 6), sticky="ew")
+
+        self.screen_btn = ctk.CTkButton(
+            actions_grid, text="🖥️  Capture Screen / Meeting", height=46,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#e65100", hover_color="#f57c00",
+            command=self.launch_screen)
+        self.screen_btn.grid(row=0, column=1, padx=(4, 0), pady=(0, 6), sticky="ew")
+
         self.video_btn = ctk.CTkButton(
-            btn_frame, text="Browse Video File", height=52,
-            font=ctk.CTkFont(size=15, weight="bold"),
+            actions_grid, text="📁  Browse Video File", height=46,
+            font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#2e7d32", hover_color="#388e3c",
             command=self.browse_video)
-        self.video_btn.pack(fill="x", pady=(0, 8))
+        self.video_btn.grid(row=1, column=0, padx=(0, 4), pady=0, sticky="ew")
 
         self.report_btn = ctk.CTkButton(
-            btn_frame, text="📑  Generate Forensic Video Report", height=46,
+            actions_grid, text="📑  Forensic Report", height=46,
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#6a1b9a", hover_color="#8e24aa",
             command=self.generate_report)
-        self.report_btn.pack(fill="x")
+        self.report_btn.grid(row=1, column=1, padx=(4, 0), pady=0, sticky="ew")
 
 
         settings = ctk.CTkFrame(self, corner_radius=10)
@@ -135,7 +150,7 @@ class App(ctk.CTk):
         self.recent_list.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._refresh_recent()
 
-        ctk.CTkLabel(self, text="Press Q inside the detection window to stop",
+        ctk.CTkLabel(self, text="Press Q in HUD to stop | In Screen mode: 'S' to crop meeting, 'F' for full screen",
                      font=ctk.CTkFont(size=11), text_color="#546e7a").pack(pady=(0, 10))
 
     def _on_thresh(self, val):
@@ -218,6 +233,9 @@ class App(ctk.CTk):
 
     def launch_webcam(self):
         self._launch(self._build_cmd(), "Webcam (live)")
+
+    def launch_screen(self):
+        self._launch(self._build_cmd("screen"), "Screen / Meeting (Press 's' in HUD to crop meeting)")
 
     def browse_video(self):
         path = filedialog.askopenfilename(

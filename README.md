@@ -101,6 +101,15 @@ pip install -r requirements.txt
   ```bash
   python infer_rt.py --backend hybrid --input 0
   ```
+- **For Live Screen / Meeting Capture (Zoom, Google Meet, Teams, YouTube):**
+  ```bash
+  python infer_rt.py --backend hybrid --input screen
+  # Controls inside HUD:
+  #   Press 's' to drag & crop a specific meeting window
+  #   Press 'f' to return to Full Screen monitoring
+  #   Press 'd' to toggle diagnostic telemetry dock
+  #   Press 'q' to quit
+  ```
 
 ### 3. Generate a Forensic Audit Report
 1. Open the UI via `python launcher.py`.
