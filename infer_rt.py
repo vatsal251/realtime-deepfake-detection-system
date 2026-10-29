@@ -464,21 +464,25 @@ class DeepfakeClassifier:
             prob_t = torch.softmax(out_t, dim=1).cpu().numpy()[0]
             t_fake = float(prob_t[0])
 
-        # 3. Continuous Adaptive Multi-Domain Fusion without step discontinuities
-        if s_fake >= 0.70:
-            # High-confidence spatial artifact (FaceForensics++, Face2Face, NeuralTextures)
-            fused_score = 0.85 * s_fake + 0.15 * t_fake
-        elif t_fake >= 0.70:
+        # 3. Multi-Modal Adaptive Evidence Fusion
+        if s_fake >= 0.75:
+            # Overwhelming spatial/FFT artifact evidence (NeuralTextures, Face2Face, FaceSwap, Deepfakes)
+            fused_score = s_fake
+            label = "fake"
+        elif t_fake >= 0.65:
             # High-confidence temporal jitter / warping (Celeb-DF, Wav2Lip)
-            fused_score = 0.25 * s_fake + 0.75 * t_fake
-        elif s_fake >= 0.50 or t_fake >= 0.50:
-            # Moderate evidence: balanced consensus
-            fused_score = 0.55 * s_fake + 0.45 * t_fake
+            fused_score = t_fake
+            label = "fake"
+        elif s_fake >= 0.50 and t_fake >= 0.25:
+            # Concordant evidence: spatial detects anomaly AND temporal does NOT contradict
+            fused_score = 0.65 * s_fake + 0.35 * t_fake
+            label = "fake" if fused_score >= 0.50 else "real"
         else:
-            # Both streams confirm natural unmanipulated video
+            # Real video baseline: temporal stream strongly refutes manipulation (t_fake < 0.25)
+            # or spatial confirms authentic textures (s_fake < 0.50)
             fused_score = 0.60 * s_fake + 0.40 * t_fake
+            label = "real"
 
-        label = "fake" if fused_score >= 0.50 else "real"
         confidence = fused_score if label == "fake" else (1.0 - fused_score)
         return label, confidence, s_fake, t_fake
 
@@ -740,27 +744,23 @@ def main():
 
                     track['raw_fake_prob'] = raw_fake_prob
                     if 'pred_history' not in track:
-                        track['pred_history'] = deque(maxlen=12)
+                        track['pred_history'] = deque(maxlen=10)
                     track['pred_history'].append(raw_fake_prob)
                     
                     # Median filter across rolling window eliminates random single-frame outliers
                     median_prob = float(np.median(list(track['pred_history'])))
                     prev_smoothed = track.get('smoothed_fake_prob', median_prob)
                     
-                    # Fast attack when manipulation rises; slow decay when speaker pauses between words (NeuralTextures)
-                    if median_prob >= prev_smoothed:
-                        alpha = 0.32  # Fast attack: locks onto manipulation cues quickly
-                    else:
-                        alpha = 0.035  # Slow decay: holds forensic peak during speech pauses / closed mouth
-                        
-                    track['smoothed_fake_prob'] = alpha * median_prob + (1.0 - alpha) * prev_smoothed
+                    # Symmetric, robust EMA on median-filtered evidence:
+                    # Preserves clean real baselines while eliminating neural texture flickers
+                    track['smoothed_fake_prob'] = 0.20 * median_prob + 0.80 * prev_smoothed
                 else:
                     # Initialize new track
                     track_id = next_track_id
                     next_track_id += 1
                     hist = deque(maxlen=8)
                     hist.append(crop)
-                    pred_hist = deque(maxlen=12)
+                    pred_hist = deque(maxlen=10)
                     
                     s_init, t_init = None, None
                     if classifier.is_hybrid:
@@ -812,19 +812,17 @@ def main():
                 smoothed_fake = track['smoothed_fake_prob']
                 prev_label = track.get('label', 'real')
                 
-                # Asymmetric Forensic Hysteresis:
-                # Once FAKE: require drop below 0.35 for 15 frames to revert to REAL (holds through speech pauses)
-                # Once REAL: require rise above fake_threshold (0.50) for 3 frames to switch to FAKE
+                # Balanced Hysteresis Deadband (±0.06 around fake_threshold)
+                hyst = 0.06
                 if prev_label == 'fake':
-                    target_label = 'real' if smoothed_fake < 0.35 else 'fake'
-                    dwell_needed = 15
+                    target_label = 'fake' if smoothed_fake >= (fake_threshold - hyst) else 'real'
                 else:
-                    target_label = 'fake' if smoothed_fake >= fake_threshold else 'real'
-                    dwell_needed = 3
+                    target_label = 'fake' if smoothed_fake >= (fake_threshold + hyst) else 'real'
                     
+                # Dwell time confirmation: requires 4 consecutive agreeing frames to switch state
                 if target_label != prev_label:
                     track['dwell_counter'] = track.get('dwell_counter', 0) + 1
-                    if track['dwell_counter'] >= dwell_needed:
+                    if track['dwell_counter'] >= 4:
                         track['label'] = target_label
                         track['dwell_counter'] = 0
                 else:
